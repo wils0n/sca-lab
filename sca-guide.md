@@ -521,7 +521,22 @@ analyze_vulnerabilities() {
 
     if [ -f "../reports/critical-vulns.json" ]; then
         echo "🚨 Vulnerabilidades CRÍTICAS encontradas:"
-        cat ../reports/critical-vulns.json | jq -r '.vulnerabilities | to_entries[] | "\(.key): \(.value.severity) - \(.value.title)"' 2>/dev/null || echo "Error procesando JSON"
+        # Mejorar el procesamiento del JSON para evitar "null"
+        cat ../reports/critical-vulns.json | jq -r '.vulnerabilities | to_entries[] |
+            if .value.title then
+                "\(.key): \(.value.severity) - \(.value.title)"
+            else
+                "\(.key): \(.value.severity) - Vulnerabilidad detectada"
+            end' 2>/dev/null || {
+            # Fallback si jq no funciona o el JSON está mal formateado
+            echo "Procesando vulnerabilidades con npm audit..."
+            npm audit --audit-level=moderate --parseable | head -20 | while IFS= read -r line; do
+                if [[ $line == *"ELSPROBLEMS"* ]]; then
+                    continue
+                fi
+                echo "🔍 $line"
+            done
+        }
     fi
 
     echo ""
@@ -531,7 +546,7 @@ analyze_vulnerabilities() {
     echo "- minimist 1.2.0 → CVE-2020-7598 (Prototype Pollution)"
     echo "- yargs-parser 13.1.1 → CVE-2020-7608 (Prototype Pollution)"
 
-    cd ~/sca-lab
+    cd ../../
 }
 
 analyze_vulnerabilities

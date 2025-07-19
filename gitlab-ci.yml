@@ -1,0 +1,66 @@
+# Pipeline simple para análisis SCA
+stages:
+  - security-scan
+
+variables:
+  REPORTS_DIR: "security-reports"
+
+before_script:
+  - mkdir -p $REPORTS_DIR
+
+# Template para artefactos
+.artifacts_template: &artifacts_template
+  artifacts:
+    paths:
+      - $REPORTS_DIR/
+    expire_in: 1 week
+    when: always
+
+# Análisis con Trivy
+trivy-scan:
+  stage: security-scan
+  image: aquasec/trivy:latest
+  <<: *artifacts_template
+  script:
+    - echo "🔍 Ejecutando análisis Trivy..."
+
+    # Actualizar base de datos
+    - trivy image --download-db-only
+
+    # Análisis del código fuente
+    - |
+      trivy fs . \
+        --format json \
+        --output $REPORTS_DIR/trivy-report.json \
+        --severity HIGH,CRITICAL
+
+    # Reporte en tabla para visualizar
+    - |
+      trivy fs . \
+        --format table \
+        --output $REPORTS_DIR/trivy-table.txt \
+        --severity HIGH,CRITICAL
+
+    # Generar SBOM
+    - |
+      trivy fs . \
+        --format cyclonedx \
+        --output $REPORTS_DIR/sbom.json
+
+    # Mostrar resumen
+    - echo "📊 Resumen del análisis:"
+    - cat $REPORTS_DIR/trivy-table.txt
+
+    # Verificar vulnerabilidades críticas
+    - |
+      CRITICAL=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length')
+      echo "🚨 Vulnerabilidades críticas encontradas: $CRITICAL"
+
+      if [ "$CRITICAL" -gt 0 ]; then
+        echo "❌ Se encontraron vulnerabilidades críticas"
+        exit 1
+      fi
+
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
