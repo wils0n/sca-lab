@@ -1,0 +1,13 @@
+{
+  "name": "vulnerable-node-app",
+  "version": "1.0.0",
+  "description": "Aplicación Node.js con dependencias vulnerables",
+  "main": "app.js",
+  "dependencies": {
+    "lodash": "4.17.19",
+    "express": "4.16.4",
+    "minimist": "1.2.0",
+    "yargs-parser": "13.1.1",
+    "axios": "0.18.0"
+  }
+}

@@ -1,0 +1,100 @@
+# =======================================
+# 📦 Node.js
+# =======================================
+
+# Dependencias
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Archivos temporales
+*.swp
+*.swo
+*.tmp
+.tmp/
+.cache/
+dist/
+build/
+
+# Entornos y configuración
+.env
+.env.*.local
+.nyc_output/
+coverage/
+.vscode/
+.DS_Store
+
+# PM2 process files
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Testing
+jest-html-reporters-*.html
+test-results/
+
+# =======================================
+# ☕ Java (Maven + Gradle)
+# =======================================
+
+# Compilados
+*.class
+
+# Build y dependencias
+target/
+out/
+build/
+.gradle/
+dependency-cache/
+.mvn/
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# Logs y temporales
+*.log
+hs_err_pid*.log
+replay_pid*.log
+
+# Seguridad
+*.jks
+*.keystore
+*.p12
+
+# Archivos generados por herramientas
+generated/
+*.war
+*.ear
+*.jar
+
+# =======================================
+# 📜 SBOM / Seguridad
+# =======================================
+
+sbom/
+*.spdx.json
+*.cdx.json
+*.cyclonedx.json
+
+# =======================================
+# 🧪 Docker/CI/CD opcional
+# =======================================
+
+docker-compose.override.yml
+.docker/
+docker.env
+
+# VSCode
+.vscode/
