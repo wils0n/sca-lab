@@ -1132,21 +1132,28 @@ En la raíz de tu proyecto, crea el archivo `.gitlab-ci.yml`:
 # Pipeline simple para análisis SCA
 stages:
   - security-scan
-  - sbom-sign
 
 variables:
   REPORTS_DIR: "security-reports"
+  # Configurar umbrales de seguridad
+  MAX_CRITICAL: "0" # Máximo de vulnerabilidades críticas permitidas
+  MAX_HIGH: "5" # Máximo de vulnerabilidades altas permitidas
 
 before_script:
   - mkdir -p $REPORTS_DIR
 
-# Template para artefactos
+# Template para artefactos mejorado
 .artifacts_template: &artifacts_template
   artifacts:
     paths:
       - $REPORTS_DIR/
-    expire_in: 1 week
+    reports:
+      # Para integración con GitLab Security Dashboard
+      sast: $REPORTS_DIR/gl-sast-report.json
+      dependency_scanning: $REPORTS_DIR/gl-dependency-scanning-report.json
+    expire_in: 30 days
     when: always
+    expose_as: "Security Analysis Reports"
 ```
 
 ---
@@ -1161,45 +1168,119 @@ Agrega este job al archivo `.gitlab-ci.yml`:
 # Análisis con Trivy
 trivy-scan:
   stage: security-scan
-  image: aquasec/trivy:latest
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
   <<: *artifacts_template
+  before_script:
+    - mkdir -p $REPORTS_DIR
+    - apk add --no-cache jq curl
   script:
     - echo "🔍 Ejecutando análisis Trivy..."
-
-    # Actualizar base de datos
     - trivy image --download-db-only
 
-    # Análisis del código fuente
+    # Análisis principal
     - |
-      trivy fs . \
+      trivy filesystem . \
         --format json \
         --output $REPORTS_DIR/trivy-report.json \
         --severity HIGH,CRITICAL
 
-    # Reporte en tabla para visualizar
+    # Generar reporte compatible con GitLab Security
     - |
-      trivy fs . \
+      trivy filesystem . \
+        --format template \
+        --template '@contrib/gitlab.tpl' \
+        --output $REPORTS_DIR/gl-dependency-scanning-report.json \
+        --severity HIGH,CRITICAL || echo "Template GitLab no disponible"
+
+    # Reporte en tabla
+    - |
+      trivy filesystem . \
         --format table \
         --output $REPORTS_DIR/trivy-table.txt \
         --severity HIGH,CRITICAL
 
     # Generar SBOM
     - |
-      trivy fs . \
+      trivy filesystem . \
         --format cyclonedx \
         --output $REPORTS_DIR/sbom.json
+
+    # Crear reporte HTML para visualización
+    - |
+      trivy filesystem . \
+        --format template \
+        --template '@contrib/html.tpl' \
+        --output $REPORTS_DIR/trivy-report.html \
+        --severity HIGH,CRITICAL || echo "Template HTML no disponible"
 
     # Mostrar resumen
     - echo "📊 Resumen del análisis:"
     - cat $REPORTS_DIR/trivy-table.txt
 
-    # Verificar vulnerabilidades críticas
+    # Generar estadísticas detalladas y EVALUAR FALLO
     - |
-      CRITICAL=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length')
-      echo "🚨 Vulnerabilidades críticas encontradas: $CRITICAL"
+      if [ -f "$REPORTS_DIR/trivy-report.json" ] && [ -s "$REPORTS_DIR/trivy-report.json" ]; then
+        CRITICAL=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
+        HIGH=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' 2>/dev/null || echo "0")
+        MEDIUM=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' 2>/dev/null || echo "0")
 
-      if [ "$CRITICAL" -gt 0 ]; then
-        echo "❌ Se encontraron vulnerabilidades críticas"
+        echo "🚨 Vulnerabilidades críticas encontradas: $CRITICAL (máx permitido: $MAX_CRITICAL)"
+        echo "⚠️  Vulnerabilidades altas encontradas: $HIGH (máx permitido: $MAX_HIGH)"
+        echo "📋 Vulnerabilidades medias encontradas: $MEDIUM"
+
+        # Crear reporte detallado
+        {
+          echo "# Reporte de Análisis de Seguridad - $(date)"
+          echo "## Resumen Ejecutivo"
+          echo "- **Críticas:** $CRITICAL (límite: $MAX_CRITICAL)"
+          echo "- **Altas:** $HIGH (límite: $MAX_HIGH)"
+          echo "- **Medias:** $MEDIUM"
+          echo ""
+          echo "## Distribución por Proyecto"
+          echo "### Java (pom.xml)"
+          echo "Vulnerabilidades: $(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[] | select(.Target | contains("pom.xml")).Vulnerabilities[]?] | length' 2>/dev/null || echo "0")"
+          echo ""
+          echo "### Node.js (package-lock.json)"
+          echo "Vulnerabilidades: $(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[] | select(.Target | contains("package-lock.json")).Vulnerabilities[]?] | length' 2>/dev/null || echo "0")"
+          echo ""
+          echo "## Detalle de Vulnerabilidades Críticas"
+          cat $REPORTS_DIR/trivy-report.json | jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL") | "- **\(.VulnerabilityID)**: \(.Title) (CVSS: \(.CVSS.nvd.V3Score // "N/A"))"' 2>/dev/null || echo "No se pudieron extraer detalles"
+        } > $REPORTS_DIR/executive-summary.md
+
+        cat $REPORTS_DIR/executive-summary.md
+
+        # Generar métricas para badges
+        echo "CRITICAL_COUNT=$CRITICAL" > $REPORTS_DIR/metrics.env
+        echo "HIGH_COUNT=$HIGH" >> $REPORTS_DIR/metrics.env
+        echo "TOTAL_COUNT=$((CRITICAL + HIGH))" >> $REPORTS_DIR/metrics.env
+
+        # ⚠️ EVALUACIÓN DE POLÍTICA DE SEGURIDAD ⚠️
+        FAIL_PIPELINE=0
+
+        if [ "$CRITICAL" -gt "$MAX_CRITICAL" ]; then
+          echo "❌ FALLO: Se encontraron $CRITICAL vulnerabilidades críticas (máximo permitido: $MAX_CRITICAL)"
+          FAIL_PIPELINE=1
+        fi
+
+        if [ "$HIGH" -gt "$MAX_HIGH" ]; then
+          echo "❌ FALLO: Se encontraron $HIGH vulnerabilidades altas (máximo permitido: $MAX_HIGH)"
+          FAIL_PIPELINE=1
+        fi
+
+        if [ "$FAIL_PIPELINE" -eq 1 ]; then
+          echo ""
+          echo "🚫 PIPELINE FALLIDO POR POLÍTICA DE SEGURIDAD"
+          echo "📋 Debes corregir las vulnerabilidades antes de continuar"
+          exit 1
+        else
+          echo "✅ Pipeline aprobado - vulnerabilidades dentro de límites aceptables"
+        fi
+
+      else
+        echo "⚠️  No se pudo procesar el archivo JSON o está vacío"
+        echo "❌ FALLO: Error procesando resultados de seguridad"
         exit 1
       fi
 
@@ -1210,309 +1291,162 @@ trivy-scan:
 
 ---
 
-### 3: Job de Análisis con OWASP Dependency-Check
-
-#### 3.1 Agregar análisis OWASP
-
-Agrega este job al archivo `.gitlab-ci.yml`:
-
-```yaml
-# Análisis con OWASP Dependency-Check
-dependency-check:
-  stage: security-scan
-  image: openjdk:11-jdk-slim
-  <<: *artifacts_template
-  script:
-    - echo "🛡️ Ejecutando OWASP Dependency-Check..."
-
-    # Instalar dependencias
-    - apt-get update && apt-get install -y curl unzip
-
-    # Descargar Dependency-Check
-    - |
-      curl -L "https://github.com/jeremylong/DependencyCheck/releases/download/v9.0.4/dependency-check-9.0.4-release.zip" -o dependency-check.zip
-      unzip -q dependency-check.zip
-      chmod +x dependency-check/bin/dependency-check.sh
-
-    # Ejecutar análisis
-    - |
-      ./dependency-check/bin/dependency-check.sh \
-        --project "$CI_PROJECT_NAME" \
-        --scan . \
-        --format HTML \
-        --format JSON \
-        --out $REPORTS_DIR \
-        --failOnCVSS 7 || true
-
-    # Renombrar reportes
-    - |
-      if [ -f "$REPORTS_DIR/dependency-check-report.html" ]; then
-        mv "$REPORTS_DIR/dependency-check-report.html" "$REPORTS_DIR/owasp-report.html"
-      fi
-      if [ -f "$REPORTS_DIR/dependency-check-report.json" ]; then
-        mv "$REPORTS_DIR/dependency-check-report.json" "$REPORTS_DIR/owasp-report.json"
-      fi
-
-    # Mostrar resumen de vulnerabilidades
-    - |
-      if [ -f "$REPORTS_DIR/owasp-report.json" ]; then
-        echo "📊 Procesando reporte OWASP..."
-        apt-get install -y jq
-        TOTAL_VULNS=$(cat $REPORTS_DIR/owasp-report.json | jq '[.dependencies[]? | select(.vulnerabilities != null) | .vulnerabilities[]] | length')
-        echo "🚨 Total de vulnerabilidades encontradas: $TOTAL_VULNS"
-      fi
-
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-```
-
 ---
 
-### 9.5: Configuración Completa
+### 5: Configuración Completa
 
 #### Archivo .gitlab-ci.yml completo:
 
 ```yaml
-
 # Pipeline simple para análisis SCA
 stages:
   - security-scan
-  - sbom-sign
+  - security-consolidation
 
 variables:
   REPORTS_DIR: "security-reports"
+  # Configurar umbrales de seguridad
+  MAX_CRITICAL: "0" # Máximo de vulnerabilidades críticas permitidas
+  MAX_HIGH: "5" # Máximo de vulnerabilidades altas permitidas
 
 before_script:
   - mkdir -p $REPORTS_DIR
 
-# Template para artefactos
+# Template para artefactos mejorado
 .artifacts_template: &artifacts_template
   artifacts:
     paths:
       - $REPORTS_DIR/
-    expire_in: 1 week
+    reports:
+      # Para integración con GitLab Security Dashboard
+      sast: $REPORTS_DIR/gl-sast-report.json
+      dependency_scanning: $REPORTS_DIR/gl-dependency-scanning-report.json
+    expire_in: 30 days
     when: always
+    expose_as: "Security Analysis Reports"
 
 # Análisis con Trivy
 trivy-scan:
   stage: security-scan
-  image: ubuntu:22.04
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
   <<: *artifacts_template
+  before_script:
+    - mkdir -p $REPORTS_DIR
+    - apk add --no-cache jq curl
   script:
-    - echo "🔍 Instalando y ejecutando análisis Trivy..."
-
-    # Actualizar sistema e instalar dependencias
-    - apt-get update && apt-get install -y curl wget jq gnupg
-
-    # Instalar Trivy
-    - |
-      echo "⬇️ Descargando e instalando Trivy..."
-      wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add -
-      echo "deb https://aquasecurity.github.io/trivy-repo/deb generic main" | tee -a /etc/apt/sources.list
-      apt-get update
-      apt-get install -y trivy
-
-    # Verificar instalación
-    - trivy --version
-
-    # Actualizar base de datos de vulnerabilidades
-    - echo "📥 Actualizando base de datos de vulnerabilidades..."
+    - echo "🔍 Ejecutando análisis Trivy..."
     - trivy image --download-db-only
 
-    # Análisis del código fuente
+    # Análisis principal
     - |
-      echo "🔍 Ejecutando análisis del filesystem..."
-      trivy fs . \
+      trivy filesystem . \
         --format json \
         --output $REPORTS_DIR/trivy-report.json \
         --severity HIGH,CRITICAL
 
-    # Reporte en tabla para visualizar
+    # Generar reporte compatible con GitLab Security
     - |
-      trivy fs . \
+      trivy filesystem . \
+        --format template \
+        --template '@contrib/gitlab.tpl' \
+        --output $REPORTS_DIR/gl-dependency-scanning-report.json \
+        --severity HIGH,CRITICAL || echo "Template GitLab no disponible"
+
+    # Reporte en tabla
+    - |
+      trivy filesystem . \
         --format table \
         --output $REPORTS_DIR/trivy-table.txt \
         --severity HIGH,CRITICAL
 
     # Generar SBOM
     - |
-      echo "📦 Generando SBOM..."
-      trivy fs . \
+      trivy filesystem . \
         --format cyclonedx \
         --output $REPORTS_DIR/sbom.json
+
+    # Crear reporte HTML para visualización
+    - |
+      trivy filesystem . \
+        --format template \
+        --template '@contrib/html.tpl' \
+        --output $REPORTS_DIR/trivy-report.html \
+        --severity HIGH,CRITICAL || echo "Template HTML no disponible"
 
     # Mostrar resumen
     - echo "📊 Resumen del análisis:"
     - cat $REPORTS_DIR/trivy-table.txt
 
-    # Verificar vulnerabilidades críticas
+    # Generar estadísticas detalladas y EVALUAR FALLO
     - |
-      CRITICAL=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length')
-      echo "🚨 Vulnerabilidades críticas encontradas: $CRITICAL"
-
-      if [ "$CRITICAL" -gt 0 ]; then
-        echo "❌ Se encontraron vulnerabilidades críticas"
-        exit 1
-      fi
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-# Análisis con OWASP Dependency-Check
-dependency-check:
-  stage: security-scan
-  image: ubuntu:22.04
-  <<: *artifacts_template
-  script:
-    - echo "🛡️ Instalando y ejecutando OWASP Dependency-Check..."
-
-    # Instalar dependencias del sistema
-    - apt-get update && apt-get install -y openjdk-11-jdk curl unzip jq wget
-
-    # Verificar Java
-    - java -version
-
-    # Descargar e instalar OWASP Dependency-Check
-    - |
-      echo "⬇️ Descargando OWASP Dependency-Check..."
-      wget "https://github.com/dependency-check/DependencyCheck/releases/download/v12.1.0/dependency-check-12.1.0-release.zip" -O dependency-check.zip
-      unzip -q dependency-check.zip
-      chmod +x dependency-check/bin/dependency-check.sh
-
-    # Verificar instalación
-    - ./dependency-check/bin/dependency-check.sh --version
-
-    # Ejecutar análisis
-    - |
-      echo "🔍 Ejecutando análisis de dependencias..."
-      ./dependency-check/bin/dependency-check.sh \
-        --project "$CI_PROJECT_NAME" \
-        --scan . \
-        --format HTML \
-        --format JSON \
-        --out $REPORTS_DIR \
-        --failOnCVSS 7 || true
-
-    # Renombrar reportes para mejor organización
-    - |
-      if [ -f "$REPORTS_DIR/dependency-check-report.html" ]; then
-        mv "$REPORTS_DIR/dependency-check-report.html" "$REPORTS_DIR/owasp-report.html"
-        echo "✅ Reporte HTML renombrado a owasp-report.html"
-      fi
-      if [ -f "$REPORTS_DIR/dependency-check-report.json" ]; then
-        mv "$REPORTS_DIR/dependency-check-report.json" "$REPORTS_DIR/owasp-report.json"
-        echo "✅ Reporte JSON renombrado a owasp-report.json"
-      fi
-
-    # Mostrar resumen de vulnerabilidades
-    - |
-      if [ -f "$REPORTS_DIR/owasp-report.json" ]; then
-        echo "📊 Procesando reporte OWASP..."
-        TOTAL_VULNS=$(cat $REPORTS_DIR/owasp-report.json | jq '[.dependencies[]? | select(.vulnerabilities != null) | .vulnerabilities[]] | length')
-        echo "🚨 Total de vulnerabilidades encontradas: $TOTAL_VULNS"
-
-        # Mostrar vulnerabilidades por severidad
-        echo "📋 Desglose por severidad:"
-        cat $REPORTS_DIR/owasp-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .vulnerabilities[] | .severity' | sort | uniq -c | while read count severity; do
-          echo "  $severity: $count"
-        done
+      if [ -f "$REPORTS_DIR/trivy-report.json" ] && [ -s "$REPORTS_DIR/trivy-report.json" ]; then
+        CRITICAL=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
+        HIGH=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' 2>/dev/null || echo "0")
+        MEDIUM=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' 2>/dev/null || echo "0")
+        
+        echo "🚨 Vulnerabilidades críticas encontradas: $CRITICAL (máx permitido: $MAX_CRITICAL)"
+        echo "⚠️  Vulnerabilidades altas encontradas: $HIGH (máx permitido: $MAX_HIGH)"
+        echo "📋 Vulnerabilidades medias encontradas: $MEDIUM"
+        
+        # Crear reporte detallado
+        {
+          echo "# Reporte de Análisis de Seguridad - $(date)"
+          echo "## Resumen Ejecutivo"
+          echo "- **Críticas:** $CRITICAL (límite: $MAX_CRITICAL)"
+          echo "- **Altas:** $HIGH (límite: $MAX_HIGH)" 
+          echo "- **Medias:** $MEDIUM"
+          echo ""
+          echo "## Distribución por Proyecto"
+          echo "### Java (pom.xml)"
+          echo "Vulnerabilidades: $(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[] | select(.Target | contains("pom.xml")).Vulnerabilities[]?] | length' 2>/dev/null || echo "0")"
+          echo ""
+          echo "### Node.js (package-lock.json)"  
+          echo "Vulnerabilidades: $(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[] | select(.Target | contains("package-lock.json")).Vulnerabilities[]?] | length' 2>/dev/null || echo "0")"
+          echo ""
+          echo "## Detalle de Vulnerabilidades Críticas"
+          cat $REPORTS_DIR/trivy-report.json | jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL") | "- **\(.VulnerabilityID)**: \(.Title) (CVSS: \(.CVSS.nvd.V3Score // "N/A"))"' 2>/dev/null || echo "No se pudieron extraer detalles"
+        } > $REPORTS_DIR/executive-summary.md
+        
+        cat $REPORTS_DIR/executive-summary.md
+        
+        # Generar métricas para badges
+        echo "CRITICAL_COUNT=$CRITICAL" > $REPORTS_DIR/metrics.env
+        echo "HIGH_COUNT=$HIGH" >> $REPORTS_DIR/metrics.env
+        echo "TOTAL_COUNT=$((CRITICAL + HIGH))" >> $REPORTS_DIR/metrics.env
+        
+        # ⚠️ EVALUACIÓN DE POLÍTICA DE SEGURIDAD ⚠️
+        FAIL_PIPELINE=0
+        
+        if [ "$CRITICAL" -gt "$MAX_CRITICAL" ]; then
+          echo "❌ FALLO: Se encontraron $CRITICAL vulnerabilidades críticas (máximo permitido: $MAX_CRITICAL)"
+          FAIL_PIPELINE=1
+        fi
+        
+        if [ "$HIGH" -gt "$MAX_HIGH" ]; then
+          echo "❌ FALLO: Se encontraron $HIGH vulnerabilidades altas (máximo permitido: $MAX_HIGH)"
+          FAIL_PIPELINE=1
+        fi
+        
+        if [ "$FAIL_PIPELINE" -eq 1 ]; then
+          echo ""
+          echo "🚫 PIPELINE FALLIDO POR POLÍTICA DE SEGURIDAD"
+          echo "📋 Debes corregir las vulnerabilidades antes de continuar"
+          exit 1
+        else
+          echo "✅ Pipeline aprobado - vulnerabilidades dentro de límites aceptables"
+        fi
+        
       else
-        echo "✅ No se generó reporte JSON - posiblemente no se encontraron vulnerabilidades"
-      fi
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-
-stages:
-  - security-scan
-
-variables:
-  REPORTS_DIR: "security-reports"
-
-before_script:
-  - mkdir -p $REPORTS_DIR
-
-# Template para artefactos
-.artifacts_template: &artifacts_template
-  artifacts:
-    paths:
-      - $REPORTS_DIR/
-    expire_in: 1 week
-    when: always
-
-# Análisis con Trivy
-trivy-scan:
-  stage: security-scan
-  image: aquasec/trivy:latest
-  <<: *artifacts_template
-  script:
-    - echo "🔍 Ejecutando análisis Trivy..."
-    - trivy image --download-db-only
-    - |
-      trivy fs . \
-        --format json \
-        --output $REPORTS_DIR/trivy-report.json \
-        --severity HIGH,CRITICAL
-    - |
-      trivy fs . \
-        --format table \
-        --output $REPORTS_DIR/trivy-table.txt \
-        --severity HIGH,CRITICAL
-    - |
-      trivy fs . \
-        --format cyclonedx \
-        --output $REPORTS_DIR/sbom.json
-    - echo "📊 Resumen del análisis:"
-    - cat $REPORTS_DIR/trivy-table.txt
-    - |
-      CRITICAL=$(cat $REPORTS_DIR/trivy-report.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length')
-      echo "🚨 Vulnerabilidades críticas encontradas: $CRITICAL"
-      if [ "$CRITICAL" -gt 0 ]; then
-        echo "❌ Se encontraron vulnerabilidades críticas"
+        echo "⚠️  No se pudo procesar el archivo JSON o está vacío"
+        echo "❌ FALLO: Error procesando resultados de seguridad"
         exit 1
       fi
+
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-# Análisis con OWASP Dependency-Check
-dependency-check:
-  stage: security-scan
-  image: openjdk:11-jdk-slim
-  <<: *artifacts_template
-  script:
-    - echo "🛡️ Ejecutando OWASP Dependency-Check..."
-    - apt-get update && apt-get install -y curl unzip jq
-    - |
-      curl -L "https://github.com/jeremylong/DependencyCheck/releases/download/v9.0.4/dependency-check-9.0.4-release.zip" -o dependency-check.zip
-      unzip -q dependency-check.zip
-      chmod +x dependency-check/bin/dependency-check.sh
-    - |
-      ./dependency-check/bin/dependency-check.sh \
-        --project "$CI_PROJECT_NAME" \
-        --scan . \
-        --format HTML \
-        --format JSON \
-        --out $REPORTS_DIR \
-        --failOnCVSS 7 || true
-    - |
-      if [ -f "$REPORTS_DIR/dependency-check-report.html" ]; then
-        mv "$REPORTS_DIR/dependency-check-report.html" "$REPORTS_DIR/owasp-report.html"
-      fi
-      if [ -f "$REPORTS_DIR/dependency-check-report.json" ]; then
-        mv "$REPORTS_DIR/dependency-check-report.json" "$REPORTS_DIR/owasp-report.json"
-      fi
-    - |
-      if [ -f "$REPORTS_DIR/owasp-report.json" ]; then
-        TOTAL_VULNS=$(cat $REPORTS_DIR/owasp-report.json | jq '[.dependencies[]? | select(.vulnerabilities != null) | .vulnerabilities[]] | length')
-        echo "🚨 Total de vulnerabilidades encontradas: $TOTAL_VULNS"
-      fi
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
 ```
 
 ---
