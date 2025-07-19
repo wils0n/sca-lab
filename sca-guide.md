@@ -1450,14 +1450,3 @@ trivy-scan:
 ```
 
 ---
-
-### 9.6.3 Archivos Generados
-
-Después de ejecutar el pipeline, encontrarás estos archivos en los artefactos:
-
-- `trivy-report.json` - Reporte detallado de Trivy
-- `trivy-table.txt` - Resumen visual de vulnerabilidades
-- `owasp-report.html` - Reporte visual de OWASP
-- `owasp-report.json` - Reporte detallado de OWASP
-
----
